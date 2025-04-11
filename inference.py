@@ -13,6 +13,9 @@ from utils import flow_viz
 from utils import frame_utils
 from utils.utils import InputPadder, forward_interpolate
 from inference import inference_core_skflow as inference_core
+import cv2  # 新增 OpenCV 读取视频
+import gc    # 用于手动清理资源
+from torchvision import transforms
 
 
 def count_parameters(model):
