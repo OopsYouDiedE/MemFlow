@@ -19,6 +19,10 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+import cv2  # 新增 OpenCV 读取视频
+import gc    # 用于手动清理资源
+from torchvision import transforms
+
 @torch.no_grad()
 def inference(cfg):
     model = build_network(cfg).cuda()
@@ -29,59 +33,72 @@ def inference(cfg):
         ckpt = torch.load(cfg.restore_ckpt, map_location='cpu')
         ckpt_model = ckpt['model'] if 'model' in ckpt else ckpt
         if 'module' in list(ckpt_model.keys())[0]:
-            for key in ckpt_model.keys():
+            for key in list(ckpt_model.keys()):
                 ckpt_model[key.replace('module.', '', 1)] = ckpt_model.pop(key)
             model.load_state_dict(ckpt_model, strict=True)
         else:
             model.load_state_dict(ckpt_model, strict=True)
 
     model.eval()
-
-    print(f"preparing image...")
-    print(f"Input image sequence dir = {cfg.seq_dir}")
-    image_list = sorted(os.listdir(cfg.seq_dir))
-
-    imgs = [frame_utils.read_gen(os.path.join(cfg.seq_dir, path)) for path in image_list]
-    imgs = [np.array(img).astype(np.uint8) for img in imgs]
-    # grayscale images
-    if len(imgs[0].shape) == 2:
-        imgs = [np.tile(img[..., None], (1, 1, 3)) for img in imgs]
-    else:
-        imgs = [img[..., :3] for img in imgs]
-    imgs = [torch.from_numpy(img).permute(2, 0, 1).float() for img in imgs]
-
-    images = torch.stack(imgs)
-
     processor = inference_core.InferenceCore(model, config=cfg)
-    # 1, T, C, H, W
-    images = images.cuda().unsqueeze(0)
 
-    padder = InputPadder(images.shape)
-    images = padder.pad(images)
+    # 打开视频流（支持摄像头或视频文件）
+    cap = cv2.VideoCapture(cfg.seq_dir)  # 若为摄像头输入可用 0
 
-    images = 2 * (images / 255.0) - 1.0
+    prev_frame_tensor = None
     flow_prev = None
-    results = []
-    print(f"start inference...")
-    for ti in range(images.shape[1] - 1):
-        flow_low, flow_pre = processor.step(images[:, ti:ti + 2], end=(ti == images.shape[1] - 2),
-                                            add_pe=('rope' in cfg and cfg.rope), flow_init=flow_prev)
-        flow_pre = padder.unpad(flow_pre[0]).cpu()
-        results.append(flow_pre)
-        if 'warm_start' in cfg and cfg.warm_start:
-            flow_prev = forward_interpolate(flow_low[0])[None].cuda()
+    frame_idx = 0
 
     if not os.path.exists(cfg.vis_dir):
         os.makedirs(cfg.vis_dir)
 
-    print(f"save results...")
-    N = len(results)
-    for idx in range(N):
-        flow_img = flow_viz.flow_to_image(results[idx].permute(1, 2, 0).numpy())
-        image = Image.fromarray(flow_img)
-        image.save('{}/flow_{:04}_to_{:04}.png'.format(cfg.vis_dir, idx + 1, idx + 2))
+    transform = transforms.ToTensor()
 
-    return
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # 预处理：BGR -> RGB, 转成 tensor
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_tensor = transform(frame_rgb).unsqueeze(0).cuda()  # 1, 3, H, W
+
+        if prev_frame_tensor is None:
+            prev_frame_tensor = frame_tensor
+            continue
+
+        # 拼接两个连续帧
+        input_pair = torch.stack([prev_frame_tensor[0], frame_tensor[0]], dim=0).unsqueeze(0)  # 1, 2, 3, H, W
+        padder = InputPadder(input_pair.shape)
+        input_pair = padder.pad(input_pair)
+        input_pair = 2 * (input_pair / 255.0) - 1.0
+
+        flow_low, flow_pre = processor.step(
+            input_pair,
+            end=False,
+            add_pe=('rope' in cfg and cfg.rope),
+            flow_init=flow_prev
+        )
+
+        flow_pre = padder.unpad(flow_pre[0]).detach().cpu()
+        if 'warm_start' in cfg and cfg.warm_start:
+            flow_prev = forward_interpolate(flow_low[0])[None].cuda()
+
+        # 可视化与保存
+        flow_img = flow_viz.flow_to_image(flow_pre.permute(1, 2, 0).numpy())
+        cv2.imwrite(f"{cfg.vis_dir}/flow_{frame_idx:04d}.png", cv2.cvtColor(flow_img, cv2.COLOR_RGB2BGR))
+
+        # 释放内存（防止内存泄露）
+        del input_pair, flow_low, flow_pre
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        prev_frame_tensor = frame_tensor
+        frame_idx += 1
+
+    cap.release()
+    print("Inference finished.")
+
 
 
 if __name__ == '__main__':
